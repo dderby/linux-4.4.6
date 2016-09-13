@@ -32,6 +32,10 @@
 #include <linux/pipe_fs_i.h>
 #include <linux/oom.h>
 #include <linux/compat.h>
+#include <linux/sched.h>
+#include <linux/fs.h>
+#include <linux/path.h>
+#include <linux/timekeeping.h>
 
 #include <asm/uaccess.h>
 #include <asm/mmu_context.h>
@@ -456,8 +460,8 @@ static void wait_for_dump_helpers(struct file *file)
 	struct pipe_inode_info *pipe = file->private_data;
 
 	pipe_lock(pipe);
-	pipe->readers++;
-	pipe->writers--;
+	atomic_inc(&pipe->readers);
+	atomic_dec(&pipe->writers);
 	wake_up_interruptible_sync(&pipe->wait);
 	kill_fasync(&pipe->fasync_readers, SIGIO, POLL_IN);
 	pipe_unlock(pipe);
@@ -466,11 +470,11 @@ static void wait_for_dump_helpers(struct file *file)
 	 * We actually want wait_event_freezable() but then we need
 	 * to clear TIF_SIGPENDING and improve dump_interrupted().
 	 */
-	wait_event_interruptible(pipe->wait, pipe->readers == 1);
+	wait_event_interruptible(pipe->wait, atomic_read(&pipe->readers) == 1);
 
 	pipe_lock(pipe);
-	pipe->readers--;
-	pipe->writers++;
+	atomic_dec(&pipe->readers);
+	atomic_inc(&pipe->writers);
 	pipe_unlock(pipe);
 }
 
@@ -517,7 +521,9 @@ void do_coredump(const siginfo_t *siginfo)
 	/* require nonrelative corefile path and be extra careful */
 	bool need_suid_safe = false;
 	bool core_dumped = false;
-	static atomic_t core_dump_count = ATOMIC_INIT(0);
+	static atomic_unchecked_t core_dump_count = ATOMIC_INIT(0);
+	long signr = siginfo->si_signo;
+	int dumpable;
 	struct coredump_params cprm = {
 		.siginfo = siginfo,
 		.regs = signal_pt_regs(),
@@ -530,12 +536,17 @@ void do_coredump(const siginfo_t *siginfo)
 		.mm_flags = mm->flags,
 	};
 
-	audit_core_dumps(siginfo->si_signo);
+	audit_core_dumps(signr);
+
+	dumpable = __get_dumpable(cprm.mm_flags);
+
+	if (signr == SIGSEGV || signr == SIGBUS || signr == SIGKILL || signr == SIGILL)
+		gr_handle_brute_attach(dumpable);
 
 	binfmt = mm->binfmt;
 	if (!binfmt || !binfmt->core_dump)
 		goto fail;
-	if (!__get_dumpable(cprm.mm_flags))
+	if (!dumpable)
 		goto fail;
 
 	cred = prepare_creds();
@@ -553,7 +564,7 @@ void do_coredump(const siginfo_t *siginfo)
 		need_suid_safe = true;
 	}
 
-	retval = coredump_wait(siginfo->si_signo, &core_state);
+	retval = coredump_wait(signr, &core_state);
 	if (retval < 0)
 		goto fail_creds;
 
@@ -596,7 +607,7 @@ void do_coredump(const siginfo_t *siginfo)
 		}
 		cprm.limit = RLIM_INFINITY;
 
-		dump_count = atomic_inc_return(&core_dump_count);
+		dump_count = atomic_inc_return_unchecked(&core_dump_count);
 		if (core_pipe_limit && (core_pipe_limit < dump_count)) {
 			printk(KERN_WARNING "Pid %d(%s) over core_pipe_limit\n",
 			       task_tgid_vnr(current), current->comm);
@@ -627,6 +638,10 @@ void do_coredump(const siginfo_t *siginfo)
 		}
 	} else {
 		struct inode *inode;
+		int open_flags = O_CREAT | O_RDWR | O_NOFOLLOW |
+				 O_LARGEFILE | O_EXCL;
+
+		gr_learn_resource(current, RLIMIT_CORE, binfmt->min_coredump, 1);
 
 		if (cprm.limit < binfmt->min_coredump)
 			goto fail_unlock;
@@ -653,7 +668,7 @@ void do_coredump(const siginfo_t *siginfo)
 			 * If it doesn't exist, that's fine. If there's some
 			 * other problem, we'll catch it at the filp_open().
 			 */
-			(void) sys_unlink((const char __user *)cn.corename);
+			(void) sys_unlink((const char __force_user *)cn.corename);
 			set_fs(old_fs);
 		}
 
@@ -665,10 +680,27 @@ void do_coredump(const siginfo_t *siginfo)
 		 * what matters is that at least one of the two processes
 		 * writes its coredump successfully, not which one.
 		 */
-		cprm.file = filp_open(cn.corename,
-				 O_CREAT | 2 | O_NOFOLLOW |
-				 O_LARGEFILE | O_EXCL,
-				 0600);
+		if (need_suid_safe) {
+			/*
+			 * Using user namespaces, normal user tasks can change
+			 * their current->fs->root to point to arbitrary
+			 * directories. Since the intention of the "only dump
+			 * with a fully qualified path" rule is to control where
+			 * coredumps may be placed using root privileges,
+			 * current->fs->root must not be used. Instead, use the
+			 * root directory of init_task.
+			 */
+			struct path root;
+
+			task_lock(&init_task);
+			get_fs_root(init_task.fs, &root);
+			task_unlock(&init_task);
+			cprm.file = file_open_root(root.dentry, root.mnt,
+				cn.corename, open_flags, 0600);
+			path_put(&root);
+		} else {
+			cprm.file = filp_open(cn.corename, open_flags, 0600);
+		}
 		if (IS_ERR(cprm.file))
 			goto fail_unlock;
 
@@ -717,7 +749,7 @@ close_fail:
 		filp_close(cprm.file, NULL);
 fail_dropcount:
 	if (ispipe)
-		atomic_dec(&core_dump_count);
+		atomic_dec_unchecked(&core_dump_count);
 fail_unlock:
 	kfree(cn.corename);
 	coredump_finish(mm, core_dumped);
@@ -738,6 +770,8 @@ int dump_emit(struct coredump_params *cprm, const void *addr, int nr)
 	struct file *file = cprm->file;
 	loff_t pos = file->f_pos;
 	ssize_t n;
+
+	gr_learn_resource(current, RLIMIT_CORE, cprm->written + nr, 1);
 	if (cprm->written + nr > cprm->limit)
 		return 0;
 	while (nr) {
