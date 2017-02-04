@@ -45,6 +45,8 @@ enum {
 
 #define GR_NLIMITS 32
 
+#define _KERNEL_SYSTEMCALL_U32S 12
+
 /* Begin Data Structures */
 
 struct sprole_pw {
@@ -99,6 +101,10 @@ struct gr_hash_struct {
 	int type;
 };
 
+typedef struct kernel_syscall_struct {
+	__u32 syscall[_KERNEL_SYSTEMCALL_U32S];
+} kernel_syscall_t;
+
 /* Userspace Grsecurity ACL data structures */
 
 struct acl_subject_label {
@@ -138,6 +144,9 @@ struct acl_subject_label {
 	struct acl_object_label **obj_hash;
 	__u32 obj_hash_size;
 	__u16 pax_flags;
+
+	kernel_syscall_t syscall_mask;
+	kernel_syscall_t syscall_drop;
 };
 
 struct role_allowed_ip {

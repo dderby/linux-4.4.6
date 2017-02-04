@@ -343,7 +343,7 @@ static inline void seccomp_sync_threads(void)
  *
  * Returns filter on success or an ERR_PTR on failure.
  */
-static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
+static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog, bool from_kernel)
 {
 	struct seccomp_filter *sfilter;
 	int ret;
@@ -370,7 +370,11 @@ static struct seccomp_filter *seccomp_prepare_filter(struct sock_fprog *fprog)
 	if (!sfilter)
 		return ERR_PTR(-ENOMEM);
 
-	ret = bpf_prog_create_from_user(&sfilter->prog, fprog,
+	if (from_kernel)
+		ret = bpf_prog_create_from_kernel(&sfilter->prog, fprog,
+					seccomp_check_filter, save_orig);
+	else
+		ret = bpf_prog_create_from_user(&sfilter->prog, fprog,
 					seccomp_check_filter, save_orig);
 	if (ret < 0) {
 		kfree(sfilter);
@@ -405,7 +409,7 @@ seccomp_prepare_user_filter(const char __user *user_filter)
 #endif
 	if (copy_from_user(&fprog, user_filter, sizeof(fprog)))
 		goto out;
-	filter = seccomp_prepare_filter(&fprog);
+	filter = seccomp_prepare_filter(&fprog, NULL);
 out:
 	return filter;
 }
@@ -762,7 +766,7 @@ out:
  * Returns 0 on success or -EINVAL on failure.
  */
 static long seccomp_set_mode_filter(unsigned int flags,
-				    const char __user *filter)
+				    const char __user *filter, bool from_kernel)
 {
 	const unsigned long seccomp_mode = SECCOMP_MODE_FILTER;
 	struct seccomp_filter *prepared = NULL;
@@ -773,7 +777,10 @@ static long seccomp_set_mode_filter(unsigned int flags,
 		return -EINVAL;
 
 	/* Prepare the new filter before holding any locks. */
-	prepared = seccomp_prepare_user_filter(filter);
+	if (from_kernel)
+		prepared = seccomp_prepare_filter(filter, from_kernel);
+	else
+		prepared = seccomp_prepare_user_filter(filter);
 	if (IS_ERR(prepared))
 		return PTR_ERR(prepared);
 
@@ -807,7 +814,7 @@ out_free:
 }
 #else
 static inline long seccomp_set_mode_filter(unsigned int flags,
-					   const char __user *filter)
+					   const char __user *filter, bool from_kernel)
 {
 	return -EINVAL;
 }
@@ -817,13 +824,16 @@ static inline long seccomp_set_mode_filter(unsigned int flags,
 static long do_seccomp(unsigned int op, unsigned int flags,
 		       const char __user *uargs)
 {
-	switch (op) {
+	switch (op & (1 << 0)) {
 	case SECCOMP_SET_MODE_STRICT:
 		if (flags != 0 || uargs != NULL)
 			return -EINVAL;
 		return seccomp_set_mode_strict();
 	case SECCOMP_SET_MODE_FILTER:
-		return seccomp_set_mode_filter(flags, uargs);
+		if (op & (1 << 1))
+			return seccomp_set_mode_filter(flags, uargs, true);
+		else
+			return seccomp_set_mode_filter(flags, uargs, NULL);
 	default:
 		return -EINVAL;
 	}

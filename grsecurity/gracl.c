@@ -40,6 +40,12 @@
 #include <asm/errno.h>
 #include <asm/mman.h>
 
+#include <linux/audit.h>
+#include <linux/filter.h>
+#include <linux/seccomp.h>
+#include <linux/prctl.h>
+#include <linux/syscalls.h>
+
 #define FOR_EACH_ROLE_START(role) \
 	role = running_polstate.role_list; \
 	while (role) {
@@ -47,6 +53,11 @@
 #define FOR_EACH_ROLE_END(role) \
 		role = role->prev; \
 	}
+
+#define arch_nr	(offsetof(struct seccomp_data, arch))
+
+#define SYSCALL_TO_INDEX(x)    ((x) >> 5)         /* 1 << 5 == bits in __u32 */
+#define SYSCALL_TO_MASK(x)     (1U << ((x) & 31)) /* mask for indexed __u32 */
 
 extern struct path gr_real_root;
 
@@ -1200,6 +1211,94 @@ gr_set_proc_res(struct task_struct *task)
 	return;
 }
 
+static int
+read_syscalls(kernel_syscall_t sc_mask, int *syscalls)
+{
+	int i;
+	int syscall_count = 0;
+
+	for (i = 0; i < _KERNEL_SYSTEMCALL_U32S * 32; i++)
+		if (sc_mask.syscall[SYSCALL_TO_INDEX(i)] & 1U << (31 & i)) {
+			syscalls[syscall_count] = i;
+			syscall_count++;
+		}
+
+	return syscall_count;
+}
+
+static void
+install_sc_whitelist_filter(kernel_syscall_t sc_mask, int t_arch, int f_errno)
+{
+	long err;
+	int i, j;
+	int syscalls[_KERNEL_SYSTEMCALL_U32S * 32];
+	int syscall_count = read_syscalls(sc_mask, syscalls);
+	int filter_size = syscall_count * 2 + 5;
+	struct sock_filter filter[filter_size];
+
+	struct sock_fprog prog;
+
+	/* VALIDATE_ARCHITECTURE */
+	filter[0].code = (unsigned short)(BPF_LD | BPF_W | BPF_ABS);
+	filter[0].jt = 0;
+	filter[0].jf = 0;
+	filter[0].k = arch_nr;
+	filter[1].code = (unsigned short)(BPF_JMP | BPF_JEQ | BPF_K);
+	filter[1].jt = 1;
+	filter[1].jf = 0;
+	filter[1].k = t_arch;
+	filter[2].code = (unsigned short)(BPF_RET | BPF_K);
+	filter[2].jt = 0;
+	filter[2].jf = 0;
+	filter[2].k = SECCOMP_RET_KILL;
+	/* EXAMINE_SYSCALL */
+	filter[3].code = (unsigned short)(BPF_LD | BPF_W | BPF_ABS);
+	filter[3].jt = 0;
+	filter[3].jf = 0;
+	filter[3].k = offsetof(struct seccomp_data, nr);
+
+	for (i = 0, j = 4; i < syscall_count ; i++) {
+		/* ALLOW_SYSCALL */
+		filter[i + j].code = (unsigned short)(BPF_JMP | BPF_JEQ | BPF_K);
+		filter[i + j].jt = 0;
+		filter[i + j].jf = 1;
+		filter[i + j++].k = syscalls[i];
+		filter[i + j].code = (unsigned short)(BPF_RET | BPF_K);
+		filter[i + j].jt = 0;
+		filter[i + j].jf = 0;
+		filter[i + j].k = SECCOMP_RET_ALLOW;
+	}
+
+	/* KILL_PROCESS */
+	filter[filter_size - 1].code = (unsigned short)(BPF_RET | BPF_K);
+	filter[filter_size - 1].jt = 0;
+	filter[filter_size - 1].jf = 0;
+	filter[filter_size - 1].k = SECCOMP_RET_KILL;
+
+	prog.len = (unsigned short)(sizeof(filter)/sizeof(filter[0])),
+	prog.filter = filter,
+
+	err = sys_seccomp(SECCOMP_SET_MODE_FILTER | SECCOMP_SET_MODE_KERNEL, 0, (const char*) &prog);
+	if (err)
+		printk(KERN_CRIT "sys_seccomp failed: %ld\n", err);
+
+	return;
+}
+
+static void
+gr_set_proc_sc(struct task_struct *task)
+{
+	struct acl_subject_label *proc;
+
+	proc = task->acl;
+
+	sys_prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+	install_sc_whitelist_filter(proc->syscall_mask, AUDIT_ARCH_X86_64, 1);
+
+	return;
+}
+
 /* both of the below must be called with
 	rcu_read_lock();
 	read_lock(&tasklist_lock);
@@ -1888,6 +1987,7 @@ skip_check:
 		task->is_writable = 1;
 
 	gr_set_proc_res(task);
+	gr_set_proc_sc(task);
 
 #ifdef CONFIG_GRKERNSEC_RBAC_DEBUG
 	printk(KERN_ALERT "Set subject label for (%s:%d): role:%s, subject:%s\n", task->comm, task_pid_nr(task), task->role->rolename, task->acl->filename);

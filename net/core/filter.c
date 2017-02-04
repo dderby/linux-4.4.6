@@ -1137,6 +1137,46 @@ int bpf_prog_create_from_user(struct bpf_prog **pfp, struct sock_fprog *fprog,
 }
 EXPORT_SYMBOL_GPL(bpf_prog_create_from_user);
 
+int bpf_prog_create_from_kernel(struct bpf_prog **pfp, struct sock_fprog *fprog,
+			      bpf_aux_classic_check_t trans, bool save_orig)
+{
+	unsigned int fsize = bpf_classic_proglen(fprog);
+	struct bpf_prog *fp;
+	int err;
+
+	/* Make sure new filter is there and in the right amounts. */
+	if (fprog->filter == NULL)
+		return -EINVAL;
+
+	fp = bpf_prog_alloc(bpf_prog_size(fprog->len), 0);
+	if (!fp)
+		return -ENOMEM;
+
+	memcpy(fp->insns, fprog->filter, (size_t) fsize);
+
+	fp->len = fprog->len;
+	fp->orig_prog = NULL;
+
+	if (save_orig) {
+		err = bpf_prog_store_orig_filter(fp, fprog);
+		if (err) {
+			__bpf_prog_free(fp);
+			return -ENOMEM;
+		}
+	}
+
+	/* bpf_prepare_filter() already takes care of freeing
+	 * memory in case something goes wrong.
+	 */
+	fp = bpf_prepare_filter(fp, trans);
+	if (IS_ERR(fp))
+		return PTR_ERR(fp);
+
+	*pfp = fp;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bpf_prog_create_from_kernel);
+
 void bpf_prog_destroy(struct bpf_prog *fp)
 {
 	__bpf_prog_release(fp);
