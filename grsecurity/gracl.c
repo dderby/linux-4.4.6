@@ -1299,6 +1299,21 @@ gr_set_proc_sc(struct task_struct *task)
 	return;
 }
 
+static void
+gr_set_proc_ns(struct task_struct *task)
+{
+	struct acl_subject_label *proc;
+	int err = 0;
+
+	proc = task->acl;
+
+	err = sys_unshare(proc->namespaces);
+	if (err)
+		printk(KERN_CRIT "sys_unshare failed: 0x%08X: Error %d\n", proc->namespaces, err);
+
+	return;
+}
+
 /* both of the below must be called with
 	rcu_read_lock();
 	read_lock(&tasklist_lock);
@@ -1987,6 +2002,7 @@ skip_check:
 		task->is_writable = 1;
 
 	gr_set_proc_res(task);
+	gr_set_proc_ns(task);
 	gr_set_proc_sc(task);
 
 #ifdef CONFIG_GRKERNSEC_RBAC_DEBUG

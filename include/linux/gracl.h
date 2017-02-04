@@ -147,6 +147,8 @@ struct acl_subject_label {
 
 	kernel_syscall_t syscall_mask;
 	kernel_syscall_t syscall_drop;
+
+	__u32 namespaces;
 };
 
 struct role_allowed_ip {
